@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -37,13 +38,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	for {
 		reply := assignTask(args)
-		if reply.State == WorkerStateFinish {
-			return
-		}
 
-		switch reply.Task.Type {
+		switch reply.NewTask.Phase {
 		case PhaseMap:
-			file, err := os.Open(reply.Task.Files[0])
+			file, err := os.Open(reply.NewTask.Files[0])
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -54,12 +52,12 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				log.Fatal(err)
 			}
 
-			kva := mapf(reply.Task.Files[0], string(content))
+			kva := mapf(reply.NewTask.Files[0], string(content))
 			buckets := buckets(kva, reply.NReduce)
 
 			onames := make([]string, 0)
-			for idx, kva := range buckets {
-				oname := fmt.Sprintf("mr-%d-%d", reply.Task.Idx, idx)
+			for i, kva := range buckets {
+				oname := fmt.Sprintf("mr-%d-%d", reply.NewTask.Idx, i)
 				ofile, _ := os.Create(oname)
 				defer ofile.Close()
 
@@ -74,13 +72,13 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				onames = append(onames, oname)
 			}
 
-			args.PrevTask = reply.Task
+			args.PrevTask = reply.NewTask
 			args.NewReduceFiles = onames
 		case PhaseReduce:
-			intermediate := kva(reply.Task.Files)
+			intermediate := kva(reply.NewTask.Files)
 			sort.Sort(ByKey(intermediate))
 
-			oname := fmt.Sprintf("mr-out-%d", reply.Task.Idx)
+			oname := fmt.Sprintf("mr-out-%d", reply.NewTask.Idx)
 			ofile, _ := os.Create(oname)
 			defer ofile.Close()
 
@@ -90,7 +88,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 					j++
 				}
-				values := []string{}
+				values := make([]string, 0)
 				for k := i; k < j; k++ {
 					values = append(values, intermediate[k].Value)
 				}
@@ -102,13 +100,19 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				i = j
 			}
 
-			args.PrevTask = reply.Task
-			args.NewReduceFiles = []string{}
+			args.PrevTask = reply.NewTask
+			args.NewReduceFiles = make([]string, 0)
+		case PhaseWait:
+			time.Sleep(200 * time.Millisecond)
+		case PhaseShutdown:
+			return
+		default:
+			log.Fatal("unknown phase")
 		}
 	}
 }
 
-// returns NReduce buckets of intermediate key-values
+// returns nReduce buckets of intermediate key-values
 func buckets(kva []KeyValue, nReduce int) [][]KeyValue {
 	buckets := make([][]KeyValue, nReduce)
 	for _, kv := range kva {

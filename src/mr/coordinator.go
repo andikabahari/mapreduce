@@ -1,17 +1,13 @@
 package mr
 
 import (
-	"errors"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"sync"
-)
-
-var (
-	ErrTaskNotFound = errors.New("task not found")
+	"time"
 )
 
 type Phase int
@@ -19,99 +15,98 @@ type Phase int
 const (
 	PhaseMap Phase = iota
 	PhaseReduce
+	PhaseWait
+	PhaseShutdown
 )
 
-type TaskStatus int
+type Status int
 
 const (
-	TaskStatusPending TaskStatus = iota
-	TaskStatusAssigned
-	TaskStatusFinish
+	StatusPending Status = iota
+	StatusAssigned
+	StatusFinish
 )
 
 type Task struct {
-	Idx    int
-	Files  []string
-	Type   Phase
-	Status TaskStatus
+	Idx       int
+	Files     []string
+	Status    Status
+	Phase     Phase
+	TimeStart time.Time
 }
 
-type WorkerState int
-
-const (
-	WorkerStateWait WorkerState = iota
-	WorkerStateReady
-	WorkerStateFinish
-)
-
 type Coordinator struct {
-	mu      sync.Mutex
-	nReduce int
-	phase   Phase
-	tasks   []Task
-	finish  bool
+	mu          sync.Mutex
+	nReduce     int
+	mapTasks    []Task
+	reduceTasks []Task
+	mapCount    int
+	reduceCount int
 }
 
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.finish {
-		reply.State = WorkerStateFinish
-		return nil
-	}
-
-	if idx, ok := c.currentPendingTask(); ok {
-		c.tasks[idx].Status = TaskStatusAssigned
-		reply.NReduce = c.nReduce
-		reply.Task = c.tasks[idx]
-		reply.State = WorkerStateReady
-	} else {
-		return ErrTaskNotFound
-	}
-
-	if _, ok := c.currentPendingTask(); !ok {
-		if c.phase == PhaseMap {
-			c.phase = PhaseReduce
-		} else if c.phase == PhaseReduce {
-			c.finish = true
-		}
-	}
-
 	if args.PrevTask.Idx >= 0 {
-		idx := args.PrevTask.Idx
-		if _, ok := c.find(idx, args.PrevTask.Type); ok {
-			c.tasks[idx].Files = args.PrevTask.Files
-			c.tasks[idx].Type = args.PrevTask.Type
-			c.tasks[idx].Status = args.PrevTask.Status
-		}
-	}
+		switch args.PrevTask.Phase {
+		case PhaseMap:
+			t := &c.mapTasks[args.PrevTask.Idx]
+			if t.Status == StatusAssigned {
+				t.Status = StatusFinish
+				c.mapCount--
+			}
 
-	if len(args.NewReduceFiles) > 0 {
-		for idx, file := range args.NewReduceFiles {
-			taskIdx, ok := c.find(idx, PhaseReduce)
-			if ok && file != "" {
-				c.tasks[taskIdx].Files = append(c.tasks[taskIdx].Files, file)
+			for i, name := range args.NewReduceFiles {
+				if name != "" {
+					c.reduceTasks[i].Files = append(c.reduceTasks[i].Files, name)
+				}
+			}
+		case PhaseReduce:
+			t := &c.reduceTasks[args.PrevTask.Idx]
+			if t.Status == StatusAssigned {
+				t.Status = StatusFinish
+				c.reduceCount--
 			}
 		}
+	}
+
+	if c.mapCount > 0 {
+		idx, ok := pendingTask(c.mapTasks)
+		if ok {
+			t := &c.mapTasks[idx]
+			t.Status = StatusAssigned
+			t.TimeStart = time.Now()
+			reply.NewTask = *t
+			reply.NReduce = c.nReduce
+		} else {
+			reply.NewTask = Task{Phase: PhaseWait}
+		}
+	} else if c.reduceCount > 0 {
+		idx, ok := pendingTask(c.reduceTasks)
+		if ok {
+			t := &c.reduceTasks[idx]
+			t.Status = StatusAssigned
+			t.TimeStart = time.Now()
+			reply.NewTask = *t
+			reply.NReduce = c.nReduce
+		} else {
+			reply.NewTask = Task{Phase: PhaseWait}
+		}
+	} else {
+		reply.NewTask = Task{Phase: PhaseShutdown}
 	}
 
 	return nil
 }
 
-func (c *Coordinator) currentPendingTask() (int, bool) {
-	for idx, task := range c.tasks {
-		if task.Status == TaskStatusPending && task.Type == c.phase {
-			return idx, true
-		}
-	}
-	return 0, false
-}
+var waitDuration time.Duration = -10 * time.Second
 
-func (c *Coordinator) find(taskIdx int, taskType Phase) (int, bool) {
-	for idx, task := range c.tasks {
-		if task.Idx == taskIdx && task.Type == taskType {
-			return idx, true
+func pendingTask(tasks []Task) (int, bool) {
+	timeWait := time.Now().Add(waitDuration)
+	for i := range tasks {
+		if tasks[i].TimeStart.Before(timeWait) && tasks[i].Status == StatusPending {
+			return i, true
 		}
 	}
 	return 0, false
@@ -137,7 +132,7 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.finish
+	return c.mapCount == 0 && c.reduceCount == 0
 }
 
 // create a Coordinator.
@@ -145,28 +140,28 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		nReduce: nReduce,
-		phase:   PhaseMap,
-		finish:  false,
+		nReduce:     nReduce,
+		mapCount:    len(files),
+		reduceCount: nReduce,
 	}
 
 	// init map tasks
-	for idx, file := range files {
-		c.tasks = append(c.tasks, Task{
-			Idx:    idx,
+	for i, file := range files {
+		c.mapTasks = append(c.mapTasks, Task{
+			Idx:    i,
 			Files:  []string{file},
-			Type:   PhaseMap,
-			Status: TaskStatusPending,
+			Status: StatusPending,
+			Phase:  PhaseMap,
 		})
 	}
 
 	// init reduce tasks
 	for i := 0; i < nReduce; i++ {
-		c.tasks = append(c.tasks, Task{
+		c.reduceTasks = append(c.reduceTasks, Task{
 			Idx:    i,
 			Files:  []string{},
-			Type:   PhaseReduce,
-			Status: TaskStatusPending,
+			Status: StatusPending,
+			Phase:  PhaseReduce,
 		})
 	}
 

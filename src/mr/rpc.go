@@ -12,8 +12,7 @@ type TaskArgs struct {
 
 type TaskReply struct {
 	NReduce int
-	Task    Task
-	State   WorkerState
+	NewTask Task
 }
 
 // Cook up a unique-ish UNIX-domain socket name
