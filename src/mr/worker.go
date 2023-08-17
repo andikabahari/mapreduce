@@ -10,7 +10,11 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+var workerId string = uuid.NewString()
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -34,14 +38,17 @@ func ihash(key string) int {
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	args := TaskArgs{PrevTask: Task{Idx: -1}}
-
 	for {
-		reply := assignTask(args)
+		reply := getTask(GetTaskArgs{WorkerId: workerId})
+		if reply.Task == nil {
+			return
+		}
 
-		switch reply.NewTask.Phase {
-		case PhaseMap:
-			file, err := os.Open(reply.NewTask.Files[0])
+		switch reply.Task.Type {
+		case TaskTypeWait:
+			time.Sleep(500 * time.Millisecond)
+		case TaskTypeMap:
+			file, err := os.Open(reply.Task.Filenames[0])
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -52,12 +59,12 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				log.Fatal(err)
 			}
 
-			kva := mapf(reply.NewTask.Files[0], string(content))
+			kva := mapf(reply.Task.Filenames[0], string(content))
 			buckets := buckets(kva, reply.NReduce)
 
 			onames := make([]string, 0)
 			for i, kva := range buckets {
-				oname := fmt.Sprintf("mr-%d-%d", reply.NewTask.Idx, i)
+				oname := fmt.Sprintf("mr-%d-%d", reply.Task.Idx, i)
 				ofile, _ := os.Create(oname)
 				defer ofile.Close()
 
@@ -71,14 +78,17 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 				onames = append(onames, oname)
 			}
+			newReduceFilenames(NewReduceFilenamesArgs{Filenames: onames})
 
-			args.PrevTask = reply.NewTask
-			args.NewReduceFiles = onames
-		case PhaseReduce:
-			intermediate := kva(reply.NewTask.Files)
+			taskFinish(TaskFinishArgs{
+				Idx:  reply.Task.Idx,
+				Type: reply.Task.Type,
+			})
+		case TaskTypeReduce:
+			intermediate := kva(reply.Task.Filenames)
 			sort.Sort(ByKey(intermediate))
 
-			oname := fmt.Sprintf("mr-out-%d", reply.NewTask.Idx)
+			oname := fmt.Sprintf("mr-out-%d", reply.Task.Idx)
 			ofile, _ := os.Create(oname)
 			defer ofile.Close()
 
@@ -100,14 +110,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				i = j
 			}
 
-			args.PrevTask = reply.NewTask
-			args.NewReduceFiles = make([]string, 0)
-		case PhaseWait:
-			time.Sleep(200 * time.Millisecond)
-		case PhaseShutdown:
-			return
-		default:
-			log.Fatal("unknown phase")
+			taskFinish(TaskFinishArgs{
+				Idx:  reply.Task.Idx,
+				Type: reply.Task.Type,
+			})
 		}
 	}
 }
@@ -144,11 +150,26 @@ func kva(files []string) []KeyValue {
 	return kva
 }
 
-func assignTask(args TaskArgs) TaskReply {
-	var reply TaskReply
-	if ok := call("Coordinator.AssignTask", args, &reply); !ok {
-		log.Println("call failed")
-		os.Exit(0)
+func getTask(args GetTaskArgs) GetTaskReply {
+	var reply GetTaskReply
+	if ok := call("Coordinator.GetTask", &args, &reply); !ok {
+		log.Println("could not fetch task")
+	}
+	return reply
+}
+
+func taskFinish(args TaskFinishArgs) TaskFinishReply {
+	var reply TaskFinishReply
+	if ok := call("Coordinator.TaskFinish", &args, &reply); !ok || !reply.Ok {
+		log.Println("could not set task status")
+	}
+	return reply
+}
+
+func newReduceFilenames(args NewReduceFilenamesArgs) NewReduceFilenamesReply {
+	var reply NewReduceFilenamesReply
+	if ok := call("Coordinator.NewReduceFilenames", &args, &reply); !ok || !reply.Ok {
+		log.Println("could not set new filenames")
 	}
 	return reply
 }

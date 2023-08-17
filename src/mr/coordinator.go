@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -10,28 +11,28 @@ import (
 	"time"
 )
 
-type Phase int
+type TaskStatus int
 
 const (
-	PhaseMap Phase = iota
-	PhaseReduce
-	PhaseWait
-	PhaseShutdown
+	TaskStatusPending TaskStatus = iota
+	TaskStatusAssigned
+	TaskStatusFinish
 )
 
-type Status int
+type TaskType int
 
 const (
-	StatusPending Status = iota
-	StatusAssigned
-	StatusFinish
+	TaskTypeMap TaskType = iota
+	TaskTypeReduce
+	TaskTypeWait
 )
 
 type Task struct {
 	Idx       int
-	Files     []string
-	Status    Status
-	Phase     Phase
+	WorkerId  string
+	Filenames []string
+	Status    TaskStatus
+	Type      TaskType
 	TimeStart time.Time
 }
 
@@ -40,76 +41,85 @@ type Coordinator struct {
 	nReduce     int
 	mapTasks    []Task
 	reduceTasks []Task
-	mapCount    int
-	reduceCount int
 }
 
-func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if args.PrevTask.Idx >= 0 {
-		switch args.PrevTask.Phase {
-		case PhaseMap:
-			t := &c.mapTasks[args.PrevTask.Idx]
-			if t.Status == StatusAssigned {
-				t.Status = StatusFinish
-				c.mapCount--
-			}
-
-			for i, name := range args.NewReduceFiles {
-				if name != "" {
-					c.reduceTasks[i].Files = append(c.reduceTasks[i].Files, name)
-				}
-			}
-		case PhaseReduce:
-			t := &c.reduceTasks[args.PrevTask.Idx]
-			if t.Status == StatusAssigned {
-				t.Status = StatusFinish
-				c.reduceCount--
-			}
+	for i := 0; i < len(c.mapTasks); i++ {
+		task := &c.mapTasks[i]
+		if task.Status == TaskStatusPending {
+			task.WorkerId = args.WorkerId
+			task.Status = TaskStatusAssigned
+			reply.NReduce = c.nReduce
+			reply.Task = task
+			return nil
 		}
 	}
 
-	if c.mapCount > 0 {
-		idx, ok := pendingTask(c.mapTasks)
-		if ok {
-			t := &c.mapTasks[idx]
-			t.Status = StatusAssigned
-			t.TimeStart = time.Now()
-			reply.NewTask = *t
+	for _, task := range c.mapTasks {
+		if task.Status != TaskStatusFinish {
+			task := &Task{Type: TaskTypeWait}
 			reply.NReduce = c.nReduce
-		} else {
-			reply.NewTask = Task{Phase: PhaseWait}
+			reply.Task = task
+			return nil
 		}
-	} else if c.reduceCount > 0 {
-		idx, ok := pendingTask(c.reduceTasks)
-		if ok {
-			t := &c.reduceTasks[idx]
-			t.Status = StatusAssigned
-			t.TimeStart = time.Now()
-			reply.NewTask = *t
+	}
+	for i := 0; i < len(c.reduceTasks); i++ {
+		task := &c.reduceTasks[i]
+		if task.Status == TaskStatusPending {
+			task.WorkerId = args.WorkerId
+			task.Status = TaskStatusAssigned
 			reply.NReduce = c.nReduce
-		} else {
-			reply.NewTask = Task{Phase: PhaseWait}
+			reply.Task = task
+			return nil
 		}
+	}
+
+	return errors.New("no pending task")
+}
+
+func (c *Coordinator) TaskFinish(args *TaskFinishArgs, reply *TaskFinishReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	reply.Ok = false
+	switch args.Type {
+	case TaskTypeMap:
+		if args.Idx >= 0 && args.Idx < len(c.mapTasks) {
+			task := &c.mapTasks[args.Idx]
+			task.Status = TaskStatusFinish
+			reply.Ok = true
+		}
+		return nil
+	case TaskTypeReduce:
+		if args.Idx >= 0 && args.Idx < len(c.reduceTasks) {
+			task := &c.reduceTasks[args.Idx]
+			task.Status = TaskStatusFinish
+			reply.Ok = true
+		}
+		return nil
+	default:
+		return errors.New("unknown task type")
+	}
+}
+
+func (c *Coordinator) NewReduceFilenames(args *NewReduceFilenamesArgs, reply *NewReduceFilenamesReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(args.Filenames) <= c.nReduce {
+		for i, filename := range args.Filenames {
+			task := &c.reduceTasks[i]
+			task.Filenames = append(task.Filenames, filename)
+		}
+		reply.Ok = true
 	} else {
-		reply.NewTask = Task{Phase: PhaseShutdown}
+		reply.Ok = false
 	}
 
 	return nil
-}
-
-var waitDuration time.Duration = -10 * time.Second
-
-func pendingTask(tasks []Task) (int, bool) {
-	timeWait := time.Now().Add(waitDuration)
-	for i := range tasks {
-		if tasks[i].TimeStart.Before(timeWait) && tasks[i].Status == StatusPending {
-			return i, true
-		}
-	}
-	return 0, false
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -132,36 +142,44 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.mapCount == 0 && c.reduceCount == 0
+	for _, task := range c.mapTasks {
+		if task.Status != TaskStatusFinish {
+			return false
+		}
+	}
+
+	for _, task := range c.reduceTasks {
+		if task.Status != TaskStatusFinish {
+			return false
+		}
+	}
+
+	return true
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{
-		nReduce:     nReduce,
-		mapCount:    len(files),
-		reduceCount: nReduce,
-	}
+	c := Coordinator{nReduce: nReduce}
 
 	// init map tasks
-	for i, file := range files {
+	for i, filename := range files {
 		c.mapTasks = append(c.mapTasks, Task{
-			Idx:    i,
-			Files:  []string{file},
-			Status: StatusPending,
-			Phase:  PhaseMap,
+			Idx:       i,
+			Filenames: []string{filename},
+			Status:    TaskStatusPending,
+			Type:      TaskTypeMap,
 		})
 	}
 
 	// init reduce tasks
 	for i := 0; i < nReduce; i++ {
 		c.reduceTasks = append(c.reduceTasks, Task{
-			Idx:    i,
-			Files:  []string{},
-			Status: StatusPending,
-			Phase:  PhaseReduce,
+			Idx:       i,
+			Filenames: []string{},
+			Status:    TaskStatusPending,
+			Type:      TaskTypeReduce,
 		})
 	}
 

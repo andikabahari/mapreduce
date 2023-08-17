@@ -5,14 +5,30 @@ import (
 	"strconv"
 )
 
-type TaskArgs struct {
-	PrevTask       Task
-	NewReduceFiles []string
+type GetTaskArgs struct {
+	WorkerId string
 }
 
-type TaskReply struct {
+type GetTaskReply struct {
 	NReduce int
-	NewTask Task
+	Task    *Task
+}
+
+type TaskFinishArgs struct {
+	Idx  int
+	Type TaskType
+}
+
+type TaskFinishReply struct {
+	Ok bool
+}
+
+type NewReduceFilenamesArgs struct {
+	Filenames []string
+}
+
+type NewReduceFilenamesReply struct {
+	Ok bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
