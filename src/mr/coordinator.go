@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -29,11 +28,10 @@ const (
 
 type Task struct {
 	Idx       int
-	WorkerId  string
 	Filenames []string
 	Status    TaskStatus
 	Type      TaskType
-	TimeStart time.Time
+	StartedAt time.Time
 }
 
 type Coordinator struct {
@@ -43,83 +41,115 @@ type Coordinator struct {
 	reduceTasks []Task
 }
 
-func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	reply.Ok = false
+
+	now := time.Now()
 
 	for i := 0; i < len(c.mapTasks); i++ {
 		task := &c.mapTasks[i]
 		if task.Status == TaskStatusPending {
-			task.WorkerId = args.WorkerId
 			task.Status = TaskStatusAssigned
+			task.StartedAt = now
+			reply.Ok = true
 			reply.NReduce = c.nReduce
 			reply.Task = task
-			return nil
+			return
 		}
 	}
 
 	for _, task := range c.mapTasks {
 		if task.Status != TaskStatusFinish {
 			task := &Task{Type: TaskTypeWait}
+			reply.Ok = true
 			reply.NReduce = c.nReduce
 			reply.Task = task
-			return nil
+			return
 		}
 	}
 	for i := 0; i < len(c.reduceTasks); i++ {
 		task := &c.reduceTasks[i]
 		if task.Status == TaskStatusPending {
-			task.WorkerId = args.WorkerId
 			task.Status = TaskStatusAssigned
+			task.StartedAt = now
+			reply.Ok = true
 			reply.NReduce = c.nReduce
 			reply.Task = task
-			return nil
+			return
 		}
 	}
 
-	return errors.New("no pending task")
+	return
 }
 
-func (c *Coordinator) TaskFinish(args *TaskFinishArgs, reply *TaskFinishReply) error {
+func (c *Coordinator) TaskFinish(args *TaskFinishArgs, reply *TaskFinishReply) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	reply.Ok = false
+
 	switch args.Type {
 	case TaskTypeMap:
-		if args.Idx >= 0 && args.Idx < len(c.mapTasks) {
-			task := &c.mapTasks[args.Idx]
-			task.Status = TaskStatusFinish
-			reply.Ok = true
+		if args.Idx < 0 || args.Idx >= len(c.mapTasks) {
+			return
 		}
-		return nil
+
+		task := &c.mapTasks[args.Idx]
+		task.Status = TaskStatusFinish
+
+		if len(args.ReduceFilenames) == c.nReduce {
+			for i, filename := range args.ReduceFilenames {
+				task := &c.reduceTasks[i]
+				task.Filenames = append(task.Filenames, filename)
+			}
+		}
+
+		reply.Ok = true
 	case TaskTypeReduce:
-		if args.Idx >= 0 && args.Idx < len(c.reduceTasks) {
-			task := &c.reduceTasks[args.Idx]
-			task.Status = TaskStatusFinish
-			reply.Ok = true
+		if args.Idx < 0 || args.Idx >= len(c.mapTasks) {
+			return
 		}
-		return nil
-	default:
-		return errors.New("unknown task type")
+
+		task := &c.reduceTasks[args.Idx]
+		task.Status = TaskStatusFinish
+
+		reply.Ok = true
 	}
+
+	return
 }
 
-func (c *Coordinator) NewReduceFilenames(args *NewReduceFilenamesArgs, reply *NewReduceFilenamesReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+const timeout = 10 * time.Second
 
-	if len(args.Filenames) <= c.nReduce {
-		for i, filename := range args.Filenames {
-			task := &c.reduceTasks[i]
-			task.Filenames = append(task.Filenames, filename)
+func (c *Coordinator) observe() {
+	ticker := time.NewTicker(1 * time.Second)
+
+	go func() {
+		for t := range ticker.C {
+			c.mu.Lock()
+
+			for i := 0; i < len(c.mapTasks); i++ {
+				task := &c.mapTasks[i]
+				if task.Status == TaskStatusAssigned && t.Sub(task.StartedAt) >= timeout {
+					task.Status = TaskStatusPending
+					task.StartedAt = time.Time{}
+				}
+			}
+
+			for i := 0; i < len(c.reduceTasks); i++ {
+				task := &c.reduceTasks[i]
+				if task.Status == TaskStatusAssigned && t.Sub(task.StartedAt) >= timeout {
+					task.Status = TaskStatusPending
+					task.StartedAt = time.Time{}
+				}
+			}
+
+			c.mu.Unlock()
 		}
-		reply.Ok = true
-	} else {
-		reply.Ok = false
-	}
-
-	return nil
+	}()
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -184,5 +214,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c.server()
+	c.observe()
 	return &c
 }

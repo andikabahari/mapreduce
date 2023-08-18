@@ -10,11 +10,7 @@ import (
 	"os"
 	"sort"
 	"time"
-
-	"github.com/google/uuid"
 )
-
-var workerId string = uuid.NewString()
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -39,7 +35,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	for {
-		reply := getTask(GetTaskArgs{WorkerId: workerId})
+		reply := getTask(GetTaskArgs{})
 		if reply.Task == nil {
 			return
 		}
@@ -65,7 +61,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			onames := make([]string, 0)
 			for i, kva := range buckets {
 				oname := fmt.Sprintf("mr-%d-%d", reply.Task.Idx, i)
-				ofile, _ := os.Create(oname)
+				ofile, err := os.Create(oname)
+				if err != nil {
+					log.Fatal(err)
+				}
 				defer ofile.Close()
 
 				enc := json.NewEncoder(ofile)
@@ -78,18 +77,21 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 				onames = append(onames, oname)
 			}
-			newReduceFilenames(NewReduceFilenamesArgs{Filenames: onames})
 
 			taskFinish(TaskFinishArgs{
-				Idx:  reply.Task.Idx,
-				Type: reply.Task.Type,
+				Idx:             reply.Task.Idx,
+				Type:            reply.Task.Type,
+				ReduceFilenames: onames,
 			})
 		case TaskTypeReduce:
 			intermediate := kva(reply.Task.Filenames)
 			sort.Sort(ByKey(intermediate))
 
 			oname := fmt.Sprintf("mr-out-%d", reply.Task.Idx)
-			ofile, _ := os.Create(oname)
+			ofile, err := os.Create(oname)
+			if err != nil {
+				log.Fatal(err)
+			}
 			defer ofile.Close()
 
 			i := 0
@@ -153,23 +155,15 @@ func kva(files []string) []KeyValue {
 func getTask(args GetTaskArgs) GetTaskReply {
 	var reply GetTaskReply
 	if ok := call("Coordinator.GetTask", &args, &reply); !ok {
-		log.Println("could not fetch task")
+		log.Println("call: something went wrong")
 	}
 	return reply
 }
 
 func taskFinish(args TaskFinishArgs) TaskFinishReply {
 	var reply TaskFinishReply
-	if ok := call("Coordinator.TaskFinish", &args, &reply); !ok || !reply.Ok {
-		log.Println("could not set task status")
-	}
-	return reply
-}
-
-func newReduceFilenames(args NewReduceFilenamesArgs) NewReduceFilenamesReply {
-	var reply NewReduceFilenamesReply
-	if ok := call("Coordinator.NewReduceFilenames", &args, &reply); !ok || !reply.Ok {
-		log.Println("could not set new filenames")
+	if ok := call("Coordinator.TaskFinish", &args, &reply); !ok {
+		log.Println("call: something went wrong")
 	}
 	return reply
 }

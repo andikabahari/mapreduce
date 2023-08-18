@@ -5,29 +5,21 @@ import (
 	"strconv"
 )
 
-type GetTaskArgs struct {
-	WorkerId string
-}
+type GetTaskArgs struct{}
 
 type GetTaskReply struct {
+	Ok      bool
 	NReduce int
 	Task    *Task
 }
 
 type TaskFinishArgs struct {
-	Idx  int
-	Type TaskType
+	Idx             int
+	Type            TaskType
+	ReduceFilenames []string
 }
 
 type TaskFinishReply struct {
-	Ok bool
-}
-
-type NewReduceFilenamesArgs struct {
-	Filenames []string
-}
-
-type NewReduceFilenamesReply struct {
 	Ok bool
 }
 
