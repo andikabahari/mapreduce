@@ -109,7 +109,7 @@ func (c *Coordinator) TaskFinish(args *TaskFinishArgs, reply *TaskFinishReply) (
 
 		reply.Ok = true
 	case TaskTypeReduce:
-		if args.Idx < 0 || args.Idx >= len(c.mapTasks) {
+		if args.Idx < 0 || args.Idx >= len(c.reduceTasks) {
 			return
 		}
 
